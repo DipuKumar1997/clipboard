@@ -3,7 +3,10 @@ package com.wifisync.gui;
 import com.wifisync.model.Peer;
 import com.wifisync.network.*;
 import com.wifisync.service.ClipboardService;
+import com.wifisync.util.FolderZipper;
 import com.wifisync.util.Logger;
+import com.wifisync.util.ResourceMonitor;
+import com.wifisync.util.SettingsManager;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -23,18 +26,24 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
     private DefaultTableModel tableModel;
     private JTextArea logArea;
     private JButton sendFileBtn;
+    private JLabel ramLabel;
 
     private final List<Peer> peers = new ArrayList<>();
     private final DiscoveryService discoveryService;
     private final NetworkServer networkServer;
     private final ClipboardService clipboardService;
+    private final ClipboardSyncManager clipboardSyncManager;
+    private final SettingsManager settingsManager;
+    private final ResourceMonitor resourceMonitor;
     private TrayIcon trayIcon;
 
     public MainFrame() {
         setTitle("Wi-Fi Sync Application");
-        setSize(880, 580);
+        setSize(880, 610);
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setLocationRelativeTo(null);
+
+        settingsManager = new SettingsManager();
 
         initUI();
         initSystemTray();
@@ -47,9 +56,17 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
         discoveryService = new DiscoveryService(this);
         networkServer = new NetworkServer(this);
         clipboardService = new ClipboardService();
+        clipboardSyncManager = new ClipboardSyncManager(this::onClipboardDelivered);
+        resourceMonitor = new ResourceMonitor();
 
         networkServer.start();
+        clipboardSyncManager.start();
         discoveryService.startListener();
+
+        resourceMonitor.start(3, usedBytes -> SwingUtilities.invokeLater(() -> {
+            long mb = usedBytes / (1024 * 1024);
+            ramLabel.setText("RAM: " + mb + " MB");
+        }));
 
         toggleClipboardSync(true);
 
@@ -92,11 +109,19 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
         sendFileBtn = new JButton("Send Files to Selected");
         sendFileBtn.addActionListener(e -> selectAndSendFiles());
 
+        JButton settingsBtn = new JButton("Settings");
+        settingsBtn.addActionListener(e -> openSettingsDialog());
+
         topPanel.add(clipboardSyncBtn);
         topPanel.add(fileSyncBtn);
         topPanel.add(refreshBtn);
         topPanel.add(toggleAllBtn);
         topPanel.add(sendFileBtn);
+        topPanel.add(settingsBtn);
+
+        ramLabel = new JLabel("RAM: -- MB");
+        ramLabel.setBorder(BorderFactory.createEmptyBorder(0, 10, 0, 10));
+        topPanel.add(ramLabel);
 
         String[] columns = {"Group Sync Enabled", "Host Name", "IP Address", "Status"};
         tableModel = new DefaultTableModel(columns, 0) {
@@ -125,6 +150,54 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
         add(topPanel, BorderLayout.NORTH);
         add(tableScrollPane, BorderLayout.CENTER);
         add(logScrollPane, BorderLayout.SOUTH);
+    }
+
+    private void openSettingsDialog() {
+        JDialog dialog = new JDialog(this, "Settings", true);
+        dialog.setLayout(new BorderLayout(8, 8));
+        dialog.setSize(480, 140);
+        dialog.setLocationRelativeTo(this);
+
+        JPanel form = new JPanel(new BorderLayout(8, 8));
+        form.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+        JLabel label = new JLabel("Download folder:");
+        JTextField pathField = new JTextField(settingsManager.getDownloadDir());
+        JButton browseBtn = new JButton("Browse...");
+        browseBtn.addActionListener(e -> {
+            JFileChooser chooser = new JFileChooser(pathField.getText());
+            chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+            if (chooser.showOpenDialog(dialog) == JFileChooser.APPROVE_OPTION) {
+                pathField.setText(chooser.getSelectedFile().getAbsolutePath());
+            }
+        });
+
+        JPanel fieldRow = new JPanel(new BorderLayout(6, 0));
+        fieldRow.add(pathField, BorderLayout.CENTER);
+        fieldRow.add(browseBtn, BorderLayout.EAST);
+
+        form.add(label, BorderLayout.NORTH);
+        form.add(fieldRow, BorderLayout.CENTER);
+
+        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton saveBtn = new JButton("Save");
+        saveBtn.addActionListener(e -> {
+            File chosen = new File(pathField.getText());
+            if (!chosen.exists() || !chosen.isDirectory()) {
+                JOptionPane.showMessageDialog(dialog, "That folder doesn't exist.", "Invalid Folder", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            settingsManager.setDownloadDir(chosen.getAbsolutePath());
+            dialog.dispose();
+        });
+        JButton cancelBtn = new JButton("Cancel");
+        cancelBtn.addActionListener(e -> dialog.dispose());
+        buttonRow.add(cancelBtn);
+        buttonRow.add(saveBtn);
+
+        dialog.add(form, BorderLayout.CENTER);
+        dialog.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setVisible(true);
     }
 
     private void initSystemTray() {
@@ -201,20 +274,29 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
     }
 
     private void broadcastClipboardToGroup(String text) {
+        List<String> targetIps = new ArrayList<>();
         for (int i = 0; i < tableModel.getRowCount(); i++) {
             if (Boolean.TRUE.equals(tableModel.getValueAt(i, 0))) {
-                NetworkClient.sendClipboardText((String) tableModel.getValueAt(i, 2), text);
+                targetIps.add((String) tableModel.getValueAt(i, 2));
             }
+        }
+        if (!targetIps.isEmpty()) {
+            clipboardSyncManager.sendToPeers(text, targetIps);
+        }
+    }
+
+    /** Called once a clipboard update has been accepted (post-dedup) from either transport. */
+    private void onClipboardDelivered(String text, String transport) {
+        if (clipboardSyncBtn.isSelected()) {
+            clipboardService.setClipboardTextContent(text);
         }
     }
 
     private void broadcastCopiedFilesToGroup(List<File> files) {
         for (File file : files) {
-            if (file.isFile()) {
-                for (int i = 0; i < tableModel.getRowCount(); i++) {
-                    if (Boolean.TRUE.equals(tableModel.getValueAt(i, 0))) {
-                        NetworkClient.sendFile((String) tableModel.getValueAt(i, 2), file);
-                    }
+            for (int i = 0; i < tableModel.getRowCount(); i++) {
+                if (Boolean.TRUE.equals(tableModel.getValueAt(i, 0))) {
+                    NetworkClient.sendFile((String) tableModel.getValueAt(i, 2), file);
                 }
             }
         }
@@ -223,6 +305,7 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
     private void selectAndSendFiles() {
         JFileChooser chooser = new JFileChooser();
         chooser.setMultiSelectionEnabled(true);
+        chooser.setFileSelectionMode(JFileChooser.FILES_AND_DIRECTORIES);
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             File[] selectedFiles = chooser.getSelectedFiles();
             for (File file : selectedFiles) {
@@ -246,29 +329,33 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
 
     @Override
     public void onClipboardReceived(String text, String fromIp) {
-        if (clipboardSyncBtn.isSelected()) {
-            clipboardService.setClipboardTextContent(text);
-        }
+        // Route through the sync manager so TCP and speculative-UDP copies
+        // of the same update are deduplicated in one place.
+        clipboardSyncManager.handleTcpReceived(text, fromIp);
     }
 
     @Override
     public boolean onFilePermissionRequested(String fileName, long fileSize, String fromIp) {
         double sizeInMb = fileSize / (1024.0 * 1024.0);
-        
+        boolean isFolder = FolderZipper.isFolderTransferName(fileName);
+        String displayName = isFolder ? FolderZipper.stripFolderMarker(fileName) : fileName;
+
         AtomicBoolean approved = new AtomicBoolean(false);
         try {
             SwingUtilities.invokeAndWait(() -> {
-                String message = String.format("Incoming File Transfer Request:\n\nFile Name: %s\nSize: %.2f MB\nSender IP: %s\n\nDo you want to receive this file?", 
-                        fileName, sizeInMb, fromIp);
-                
+                String message = String.format(
+                        "Incoming %s Transfer Request:\n\n%s Name: %s\nSize: %.2f MB\nSender IP: %s\n\nDo you want to receive this %s?",
+                        isFolder ? "Folder" : "File", isFolder ? "Folder" : "File", displayName, sizeInMb, fromIp,
+                        isFolder ? "folder" : "file");
+
                 int option = JOptionPane.showConfirmDialog(
                         this,
                         message,
-                        "File Transfer Confirmation",
+                        (isFolder ? "Folder" : "File") + " Transfer Confirmation",
                         JOptionPane.YES_NO_OPTION,
                         JOptionPane.QUESTION_MESSAGE
                 );
-                
+
                 approved.set(option == JOptionPane.YES_OPTION);
             });
         } catch (Exception e) {
@@ -281,7 +368,16 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
     @Override
     public void onFileReceived(String fileName, byte[] data, String fromIp) {
         try {
-            File downloadsDir = new File(System.getProperty("user.home"), "Downloads");
+            File downloadsDir = new File(settingsManager.getDownloadDir());
+
+            if (FolderZipper.isFolderTransferName(fileName)) {
+                String folderName = FolderZipper.stripFolderMarker(fileName);
+                File destDir = new File(downloadsDir, "Sync_" + folderName);
+                FolderZipper.unzipToDirectory(data, destDir);
+                Logger.log("MAIN", ">>> FOLDER RECEIVED & EXTRACTED: " + destDir.getAbsolutePath());
+                return;
+            }
+
             File dest = new File(downloadsDir, "Sync_" + fileName);
             try (FileOutputStream fos = new FileOutputStream(dest)) {
                 fos.write(data);
@@ -297,6 +393,8 @@ public class MainFrame extends JFrame implements DiscoveryService.PeerDiscoveryL
         discoveryService.stop();
         networkServer.stop();
         clipboardService.stopListening();
+        clipboardSyncManager.stop();
+        resourceMonitor.stop();
         super.dispose();
     }
 }
