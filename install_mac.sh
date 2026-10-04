@@ -57,6 +57,14 @@ cat << EOF > "$PLIST_FILE"
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Without this, launchd may start AirMesh outside a normal GUI (Aqua)
+         session, which can silently block access to the pasteboard/window
+         server -- this is the most common cause of "clipboard sync just
+         doesn't do anything" on macOS when launched at login. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>/tmp/airmesh.log</string>
     <key>StandardErrorPath</key>
