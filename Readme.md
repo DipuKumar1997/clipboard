@@ -4,16 +4,22 @@ AirMesh is a lightweight Linux utility for clipboard synchronization and peer-to
 
 ## Features
 
-- TCP clipboard/file transfer on **port 8889**
+- TCP clipboard/file transfer on **port 8889**, plus a parallel UDP fast-path on **port 8890**
 - Clipboard synchronization with anti-echo protection
+- Folder (and macOS package: `.pages`/`.key`/`.numbers`) transfers via on-the-fly zip
+- Configurable download folder via Settings
+- Single-instance guard (no duplicate tray icons)
+- Live RAM usage display
 - Systemd user-service integration
-- 
+
 ## Architecture
 
 - `Main.java` — Application entry point and `--minimized` argument.
 - `DiscoveryService.java` — UDP discovery using port `8888`.
-- `NetworkServer` / `NetworkClient` — TCP communication using port `8889`.
+- `NetworkServer` / `NetworkClient` — TCP communication using port `8889` (files and the reliable clipboard path).
+- `ClipboardSyncManager.java` — Parallel TCP (reliable) + UDP (speculative, port `8890`) clipboard delivery with dedup.
 - `ClipboardService.java` — System clipboard monitoring and synchronization.
+- `SettingsManager.java` / `SingleInstanceGuard.java` / `ResourceMonitor.java` / `FolderZipper.java` — Supporting utilities.
 - `wifi-sync-app.service` — Systemd background service.
 
 ## Requirements
@@ -27,6 +33,7 @@ chmod +x install.sh
 ./install.sh
 sudo ufw allow 8888/udp
 sudo ufw allow 8889/tcp
+sudo ufw allow 8890/udp
 sudo ufw reload
 
 systemctl --user enable --now wifi-sync-app.service
@@ -114,6 +121,9 @@ Both devices must:
              |<---- TCP 8889 ---------->|
              | Clipboard / Files        |
              |                           |
+             |<---- UDP 8890 ---------->|
+             | Clipboard (fast path)    |
+             |                           |
              +---------------------------+
 ```
 
@@ -130,17 +140,36 @@ Used for:
 
 Used for:
 
-- Clipboard synchronization
-- File transfers
+- Clipboard synchronization (reliable path, retried on failure)
+- File and folder transfers
 - Incoming connections
 - Peer-to-peer communication
+
+### UDP Port 8890
+
+Used for:
+
+- Speculative low-latency clipboard delivery, sent in parallel with the TCP
+  path. Whichever copy (TCP or UDP) arrives first is applied; the other is
+  recognized as a duplicate and dropped.
+
+## Other Features
+
+- **Folder transfers**: copying a folder (or a macOS document package like
+  `.pages`/`.key`/`.numbers`) zips it on the fly and unpacks it automatically
+  on the receiving end.
+- **Settings**: use the "Settings" button to change the download folder
+  incoming files/folders are saved to (defaults to `~/Downloads`).
+- **Single instance**: AirMesh refuses to start a second copy of itself on
+  the same machine, which is what was causing duplicate tray icons on Linux.
+- **RAM usage**: shown live in the control panel next to the peer table.
 
 ## Security
 
 AirMesh is designed for trusted local networks.
 
 - Do not expose port `8889` to the public internet.
-- Do not forward ports `8888` or `8889` on your router.
+- Do not forward ports `8888`, `8889`, or `8890` on your router.
 - Avoid using AirMesh on untrusted public Wi-Fi.
 - Incoming file transfers should require user confirmation.
 - Use firewall rules to limit access where appropriate.
